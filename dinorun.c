@@ -242,7 +242,7 @@ popup(const char *msg, ...)
 		c = getch();
 		if (c == '\n' || c == KEY_ENTER || NOCASE(c) == 'y') {
 			confirm = YES;
-		} else if (NOCASE(c) == 'n') {
+		} else if (c == CTRL('c') || c == CTRL('d') || NOCASE(c) == 'n') {
 			confirm = NO;
 		}
 		usleep(10000);
@@ -252,7 +252,6 @@ popup(const char *msg, ...)
 
 	return confirm;
 }
-
 
 void
 dispupdate()
