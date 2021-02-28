@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <string.h>
+#include <errno.h>
 
 #include <ncurses.h>
 #include <time.h>
@@ -51,7 +52,7 @@ struct player {
 	const struct model *m;
 };
 
-static const int screenminw = 42;
+static const int screenminw = 60;
 static const int screenminh = 30;
 
 static const float groundy = 2;
@@ -163,6 +164,23 @@ die(const char *errstr, ...)
 }
 
 void
+handleresize()
+{
+	do {
+		getmaxyx(stdscr, screenh, screenw);
+		if (screenw < screenminw || screenh < screenminw) {
+			clear();
+			printw("[X] Too few rows / columns to run properly.");
+			refresh();
+			usleep(10000);
+		}
+	} while (screenw < screenminw || screenh < screenminw);
+
+	ww = screenw - 2;
+	wh = 14;
+}
+
+void
 resetgame()
 {
 	struct obstacle *o, *tmp;
@@ -203,17 +221,6 @@ drawmodel(WINDOW *w, int sx, int sy, const struct model *m)
 	}
 }
 
-void*
-assertp(void* p)
-{
-	if (!p) {
-		perror("malloc");
-		quit = 1;
-		exit(1);
-	}
-	return p;
-}
-
 int
 popup(const char *msg, ...)
 {
@@ -225,27 +232,36 @@ popup(const char *msg, ...)
 	len = vsnprintf(NULL, 0, msg, ap);
 	va_end(ap);
 
-	win = newwin(5, len + 4, (screenh - 5) / 2,
-			(screenw - len - 4) / 2);
-	wclear(win);
-	box(win, 0, 0);
-
-	wmove(win, 2, 2);
-	va_start(ap, msg);
-	vw_printw(win, msg, ap);
-	va_end(ap);
-
-	wrefresh(win);
-
-	confirm = 0;
 	while (!quit && !confirm) {
-		c = getch();
-		if (c == '\n' || c == KEY_ENTER || NOCASE(c) == 'y') {
-			confirm = YES;
-		} else if (c == CTRL('c') || c == CTRL('d') || NOCASE(c) == 'n') {
-			confirm = NO;
+		win = newwin(5, len + 4, (screenh - 5) / 2,
+				(screenw - len - 4) / 2);
+		wclear(win);
+		box(win, 0, 0);
+
+		wmove(win, 2, 2);
+		va_start(ap, msg);
+		vw_printw(win, msg, ap);
+		va_end(ap);
+
+		wnoutrefresh(stdscr);
+		wnoutrefresh(win);
+		doupdate();
+
+		confirm = 0;
+
+		while (!quit && !confirm) {
+			c = getch();
+			if (c == KEY_RESIZE) {
+				wclear(stdscr);
+				handleresize();
+				break;
+			} else if (c == '\n' || c == KEY_ENTER || NOCASE(c) == 'y') {
+				confirm = YES;
+			} else if (c == CTRL('c') || c == CTRL('d') || NOCASE(c) == 'n') {
+				confirm = NO;
+			}
+			usleep(10000);
 		}
-		usleep(10000);
 	}
 
 	delwin(win);
@@ -265,12 +281,10 @@ dispupdate()
 	box(scorewin, 0, 0);
 	wrefresh(scorewin);
 
-	ww = screenw - 2;
-	wh = 14;
 	gamewin = newwin(wh, ww,
 			(screenh - wh) / 2,
 			(screenw - ww) / 2);
-	wrefresh(gamewin);
+	wnoutrefresh(gamewin);
 
 	p.x = ww / 4.f;
 
@@ -366,10 +380,8 @@ dispupdate()
 		/* generate new obstacles */
 		if (groupi < groupmax || dist > lastspawn + spawn_spacingmin
 				+ rand() % (spawn_spacingmax + 1 - spawn_spacingmin)) {
-			if (!(o = malloc(sizeof(struct obstacle)))) {
-				perror("malloc()");
-				quit = 1;
-			}
+			if (!(o = malloc(sizeof(struct obstacle))))
+				die("malloc: %s\n", strerror(errno));
 
 			if (groupi >= groupmax) {
 				grouptype = (rand() % 10 > 6) ? BIRD : TREE;
@@ -463,24 +475,16 @@ main(int argc, char** argv)
 	while (!quit) {
 
 		if (reset) resetgame();
+		handleresize();
 
-		getmaxyx(stdscr, screenh, screenw);
-		if (screenw < screenminw || screenh < screenminw) {
-			wclear(stdscr);
-			printw("[X] Too few rows / columns to run properly.");
-			wrefresh(stdscr);
-			usleep(100);
-			continue;
-		}
-
-		floor = realloc(floor, screenw * sizeof(int));
+		if (!(floor = realloc(floor, screenw * sizeof(int))))
+			die("realloc: %s\n", strerror(errno));
 		floorlen = MIN(floorlen, screenw);
 
 		redraw = 0;
 		reset = 0;
 		confirm = 0;
 
-		wrefresh(stdscr);
 		dispupdate();
 	}
 
