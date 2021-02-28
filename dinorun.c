@@ -3,34 +3,34 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <string.h>
 
 #include <ncurses.h>
 #include <time.h>
 
-#define ctrl(x)   ((x) & 0x1f)
-#define nocase(x) ((x) | 0b100000)
+#define CTRL(x)   ((x) & 0x1f)
+#define NOCASE(x) ((x) | 0b100000)
 
 #define A(x) (x | A_ALTCHARSET)
 #define N(x) (x)
+#define I(x) (x | A_ITALIC)
 
 #define FOR_ADVANCE(pos, start) pos = start; pos; pos = pos->next
 #define FOR_ADVANCE_P(pos, start) pos = start; *pos; pos = &((*pos)->next)
 
 #define ARRSIZE(x) (sizeof(x)/sizeof((x)[0]))
 
-#define FRAME_TIME (1 / 30.f)
+#define FRAME_RATE 30
+#define FRAME_TIME (1 / (1.f * FRAME_RATE))
 
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
 enum { BIRD, TREE };
 
-enum {
-	PF_NONE = 0,
-	PF_JUMP = 1,
-	PF_DEAD = 2,
-	PF_FALL = 4
-};
+enum { YES = 1, NO = 2 };
+
+enum { JUMP = 1, DEAD = 2, DUCK = 4 };
 
 struct obstacle {
 	float x, y;
@@ -51,43 +51,50 @@ struct player {
 	const struct model *m;
 };
 
-struct state {
-	pid_t master;
-
-	int reset, redraw, quit;
-	int score;
-
-	int screenw, screenh;
-	int ww, wh;
-
-	struct player p;
-};
-
 static const int screenminw = 42;
 static const int screenminh = 30;
 
 static const float groundy = 2;
 
-static const int spawn_spacingmin  = 40;
-static const int spawn_spacingvar  = 4;
+static const int spawn_spacingmin = 50;
+static const int spawn_spacingmax = 80;
 
-static const int bird_spawnmaxh = 6;
-static const int bird_spawnminh = 1;
+static const int bird_spawnmaxh = 5;
+static const int bird_spawnminh = 0;
 
-static const float playerjumpvel = 20;
-static const int playeracc = -13;
+static const float playerjumpvel = 35;
+static const int playeracc = -18;
 
-static const struct model playerm_run = {
+static const int gamespeed = 80;
+
+static const struct model playerm_run1 = {
 	.w = 2, .h = 3, .parts = {
 		A(102), N('>'), // °>
 		A(120), N(')'), // |)
-		N('v'), N('v')  // vv
+		I('v'), N(' ')  // v
+	}
+};
+static const struct model playerm_run2 = {
+	.w = 2, .h = 3, .parts = {
+		A(102), N('>'), // °>
+		A(120), N(')'), // |)
+		N(' '), I('v')  //  v
+	}
+};
+static const struct model playerm_air = {
+	.w = 2, .h = 3, .parts = {
+		A(102), N('>'), // °>
+		A(120), N(')'), // |)
+		I('v'), I('v')  // vv
 	}
 };
 static const struct model playerm_duck = {
 	.w = 5, .h = 1, .parts = {
-		N('v'), N('v'), N('='), A(102), N('>') // vv=°>
+		I('v'), I('v'), N('='), A(102), N('>') // vv=°>
 	}
+};
+static const struct model *playerm_runs[] = {
+	&playerm_run1, &playerm_run2
 };
 
 static const struct model birdm = {
@@ -97,25 +104,27 @@ static const struct model birdm = {
 };
 
 static const struct model treem1 ={
-	.w = 3, .h = 4, .parts = {
+	.w = 3, .h = 5, .parts = {
 		N(' '), A(120), N(' '), //   |
 		A(109), A(110), A(106), // |---|
 		N(' '), A(117), N(' '), //  -|
-		N(' '), A(116), N(' ')  //   |-
+		N(' '), A(116), N(' '), //   |-
+		A(113), A(118), A(113)  //  -+-
 	}
 };
 static const struct model treem2 = {
-	.w = 1, .h = 3, .parts = {
+	.w = 1, .h = 4, .parts = {
 		A(116),                 //   |-
 		A(117),                 //  -|
-		A(120)                  //   |
+		A(120),                 //   |
+		A(118)                  //  -+-
 	}
 };
 static const struct model treem3 = {
 	.w = 1, .h = 3, .parts = {
+		A(117),                 //  -|
 		A(116),                 //   |-
-		A(116),                 //   |-
-		A(117)                  //  -|
+		A(118)                  //  -+-
 	}
 };
 static const int treemcount = 3;
@@ -123,29 +132,60 @@ static const struct model *treems[] = {
 	&treem1, &treem2, &treem3
 };
 
-static struct player player;
-
 static WINDOW *gamewin, *scorewin;
-
-static int popup = 0, popup_confirm = 0;
-
-static struct state *game;
-
-static const int gamespeed = 100;
-
 static struct obstacle *obstacles = NULL;
+static int floorlen = 0, *floor = NULL;
+static struct player p;
+
+static int reset, redraw, quit, confirm;
+
+static long dist, lastspawn;
+
+static int playerm_runi, groupi, groupmax, grouptype, nextspawn;
+static float dxf = 0;
+static int bird_lasty = 0;
+
+static int lastduck, ticks;
+
+static int screenw, screenh, ww, wh;
 
 void
-stubhandle(int s)
+die(const char *errstr, ...)
 {
+	va_list ap;
 
+	endwin();
+	va_start(ap, errstr);
+	vfprintf(stderr, errstr, ap);
+	va_end(ap);
+
+	exit(1);
 }
 
 void
-resetgame(struct state *game)
+resetgame()
 {
-	game->p.y = groundy;
-	game->p.m = &playerm_run;
+	struct obstacle *o, *tmp;
+
+	memset(&p, 0, sizeof(struct player));
+	p.y = groundy;
+	p.m = &playerm_run1;
+
+	dist = lastspawn = 0;
+	groupi = groupmax = 0;
+	nextspawn = 0;
+
+	dxf = 0.f;
+
+	lastspawn = 50;
+
+	for (o = obstacles; o; o = tmp) {
+		tmp = o->next;
+		free(o);
+	}
+	obstacles = NULL;
+
+	srand(time(NULL));
 }
 
 void
@@ -155,9 +195,6 @@ drawmodel(WINDOW *w, int sx, int sy, const struct model *m)
 
 	getmaxyx(w, maxy, maxx);
 
-	mvwaddch(w, maxy - 1, maxx - 1, 'O');
-	mvwaddch(w, 0, maxx - 1, 'O');
-
 	for (y = 0; y < m->h; y++) {
 		for (x = 0; x < m->w; x++) {
 			mvwaddch(w, maxy - sy - (m->h - 1) + y,
@@ -165,6 +202,57 @@ drawmodel(WINDOW *w, int sx, int sy, const struct model *m)
 		}
 	}
 }
+
+void*
+assertp(void* p)
+{
+	if (!p) {
+		perror("malloc");
+		quit = 1;
+		exit(1);
+	}
+	return p;
+}
+
+int
+popup(const char *msg, ...)
+{
+	WINDOW *win;
+	va_list ap;
+	int i, c, len;
+
+	va_start(ap, msg);
+	len = vsnprintf(NULL, 0, msg, ap);
+	va_end(ap);
+
+	win = newwin(5, len + 4, (screenh - 5) / 2,
+			(screenw - len - 4) / 2);
+	wclear(win);
+	box(win, 0, 0);
+
+	wmove(win, 2, 2);
+	va_start(ap, msg);
+	vw_printw(win, msg, ap);
+	va_end(ap);
+
+	wrefresh(win);
+
+	confirm = 0;
+	while (!quit && !confirm) {
+		c = getch();
+		if (c == '\n' || c == KEY_ENTER || NOCASE(c) == 'y') {
+			confirm = YES;
+		} else if (NOCASE(c) == 'n') {
+			confirm = NO;
+		}
+		usleep(10000);
+	}
+
+	delwin(win);
+
+	return confirm;
+}
+
 
 void
 dispupdate()
@@ -174,56 +262,85 @@ dispupdate()
 	box(stdscr, 0, 0);
 	wrefresh(stdscr);
 
-	scorewin = newwin(3, 12, 1, game->ww - 14);
+	scorewin = newwin(3, 12, 1, screenw - 14);
 	box(scorewin, 0, 0);
 	wrefresh(scorewin);
 
-	game->ww = game->screenw - 2;
-	game->wh = 14;
-	gamewin = newwin(game->wh, game->ww,
-			(game->screenh - game->wh) / 2,
-			(game->screenw - game->ww) / 2);
+	ww = screenw - 2;
+	wh = 14;
+	gamewin = newwin(wh, ww,
+			(screenh - wh) / 2,
+			(screenw - ww) / 2);
 	wrefresh(gamewin);
 
-	srand(time(NULL));
+	p.x = ww / 4.f;
 
-	game->p.x = game->ww / 4.f;
-
-	while (!game->quit && !game->redraw) {
-		static float travel = 0;
-		static long dist = 0, lastspawn = 50;
+	while (!quit && !redraw && !reset) {
 		struct obstacle *o, **op, *tmp;
 		float nvel;
-		int i, x, y;
+		int i, x, y, dx, c;
+
+		/* handle input */
+		while ((c = getch()) != ERR) {
+			if (c == KEY_RESIZE) {
+				redraw = 1;
+			} else if (c == CTRL('c') || c == CTRL('d')) {
+				quit = 1;
+			} else if (NOCASE(c) == 's' || c == KEY_DOWN) {
+				p.flags |= DUCK;
+				lastduck = ticks;
+			} else if (NOCASE(c) == 'w' || c == KEY_UP || c == ' ') {
+				p.flags |= JUMP;
+			}
+		}
 
 		werase(gamewin);
 
 		/* update player */
-		nvel = game->p.vely + FRAME_TIME * (game->p.y - groundy) * playeracc;
-		if (nvel < 0 && game->p.vely >= 0)
-			game->p.flags &= ~PF_JUMP; /* reset jump buffer at height of jump */
-		game->p.vely = nvel;
-		if (game->p.y == groundy && (game->p.flags & PF_JUMP)) {
-			game->p.vely = playerjumpvel;
-			game->p.flags &= ~PF_JUMP;
+		nvel = p.vely + FRAME_TIME * (p.y - groundy) * playeracc;
+		if (nvel < 0 && p.vely >= 0)
+			p.flags &= ~JUMP; /* reset jump buffer at height of jump */
+		p.vely = nvel;
+
+		if (p.y == groundy && (p.flags & JUMP)) {
+			p.vely = playerjumpvel;
+			p.flags &= ~JUMP & ~DUCK;
+		} else if (p.y > groundy && (p.flags & DUCK)) {
+			p.vely = -17;
+			p.flags &= ~DUCK;
 		}
-		game->p.y = MAX(groundy, game->p.y + game->p.vely * FRAME_TIME);
-		if (game->p.y == groundy) game->p.vely = 0;
+
+		p.y = MAX(groundy, p.y + p.vely * FRAME_TIME);
+		if (p.y == groundy) p.vely = 0;
+
+		if ((p.flags & DUCK) && p.y == groundy) {
+			p.m = &playerm_duck;
+			if ((ticks - lastduck) > FRAME_RATE / 3.f)
+				p.flags &= ~DUCK;
+		} else if (p.y > groundy) {
+			p.m = &playerm_air;
+		} else {
+			if ((ticks % 3) == 0)
+				playerm_runi = !playerm_runi;
+			p.m = playerm_runs[playerm_runi];
+		}
 
 		/* move obstacles and check collisions */
-		travel += FRAME_TIME * gamespeed;
-		if (travel > 1) {
+		dxf += FRAME_TIME * gamespeed;
+		if (dxf >= 1.f) {
+			int inx, iny;
+
 			for (op = &obstacles; *op;) {
 				o = *op;
-				o->x -= travel;
 
-				/* TODO: make sure player cant glitch through obstacles */
-				if (o->x < game->p.x + game->p.m->w && o->x >= game->p.x
-						&& o->y < game->p.y + game->p.m->h && o->y >= game->p.y) {
-					// COLLISION
-					game->p.flags |= PF_DEAD;
-				}
+				inx = (p.x + p.m->w > o->x - dxf
+						&& p.x < o->x + o->m->w);
+				iny = (p.y + p.m->h > o->y
+						&& p.y < o->y + o->m->h);
 
+				if (inx && iny) p.flags |= DEAD;
+
+				o->x -= (int) dxf;
 				if (o->x + o->m->w < -1) { /* despawn */
 					*op = (*op)->next;
 					free(o);
@@ -231,66 +348,96 @@ dispupdate()
 					op = &((*op)->next);
 				}
 			}
-			dist += travel;
-			travel = 0;
+
+			floorlen = MAX(0, floorlen - dxf);
+			for (i = 0; i < floorlen; i++)
+				floor[i] = floor[i + (int) dxf];
+
+			dx = dxf;
+			dxf -= (float) dx;
 		}
 
-		/* generate new obstacles */
-		if (dist > lastspawn + spawn_spacingmin + rand() % spawn_spacingvar) {
-			int type;
+		dist += dx;
+		nextspawn = MAX(0, nextspawn - dx);
 
+		for (i = floorlen; i < screenw; i++)
+			floor[i] = (rand() % 9 == 0) ? A(118) : A(113);
+		floorlen = screenw;
+
+		/* generate new obstacles */
+		if (groupi < groupmax || dist > lastspawn + spawn_spacingmin
+				+ rand() % (spawn_spacingmax + 1 - spawn_spacingmin)) {
 			if (!(o = malloc(sizeof(struct obstacle)))) {
 				perror("malloc()");
-				game->quit = 1;
-				exit(1);
+				quit = 1;
 			}
 
-			o->type = rand() % 2;
+			if (groupi >= groupmax) {
+				grouptype = (rand() % 10 > 6) ? BIRD : TREE;
+				if (grouptype == BIRD) {
+					groupmax = 1 + rand() % 2;
+				} else {
+					groupmax = 1 + rand() % 4;
+				}
+				groupi = 0;
+			}
+
+			o->type = grouptype;
 			if (o->type == BIRD) {
 				o->m = &birdm;
-				o->y = bird_spawnminh + rand() % (bird_spawnmaxh + 1 - bird_spawnminh);
+				do {
+					o->y = groundy + bird_spawnminh + rand() %
+						(bird_spawnmaxh + 1 - bird_spawnminh);
+				} while (groupi > 0 && o->y == bird_lasty);
+				bird_lasty = o->y;
 			} else if (o->type == TREE) {
 				o->m = treems[rand() % treemcount];
-				o->y = groundy;
+				o->y = groundy - 1;
 			}
 
-			o->x = game->screenw + 2;
+			o->x = screenw + 2 + nextspawn;
+			nextspawn += o->m->w + 1;
 
 			tmp = obstacles;
 			obstacles = o;
 			if (tmp) o->next = tmp;
 			else o->next = NULL;
 			lastspawn = dist;
+
+			groupi++;
 		}
+
+		/* draw floor */
+		for (i = 0; i < ww - 2; i++)
+			mvwaddch(gamewin, wh - groundy + 1, 1 + i, floor[i]);
 
 		/* draw obstacles */
-		for (FOR_ADVANCE(o, obstacles)) {
+		for (FOR_ADVANCE(o, obstacles))
 			drawmodel(gamewin, o->x, o->y, o->m);
-		}
 
 		/* draw player */
-		drawmodel(gamewin, game->p.x, game->p.y, game->p.m);
+		drawmodel(gamewin, p.x, p.y, p.m);
 
 		/* display score */
+		mvwprintw(scorewin, 1, 2, "%8d", dist);
 
 		/* refresh windows */
-		wnoutrefresh(scorewin);
 		wnoutrefresh(gamewin);
+		wnoutrefresh(scorewin);
 		doupdate();
 
-		game->score += FRAME_TIME * 10;
-
-		if (game->p.flags & PF_DEAD) {
-			// const char *deathmsg = "You traveled %i! Play again? [Y/N]";
-			// TODO:
-			// - show end card
-			// - wait for input
-			// - restart / exit
-			game->quit = 1;
-			kill(game->master, SIGINT);
+		if (p.flags & DEAD) {
+			if (popup("You traveled %i m! Play again? [Y/N]",
+						dist) == NO) {
+				quit = 1;
+			} else {
+				reset = 1;
+				redraw = 1;
+			}
 			break;
 		}
 
+		ticks++;
 		usleep(FRAME_TIME * 1000000);
 	}
 
@@ -302,7 +449,7 @@ dispupdate()
 int
 main(int argc, char** argv)
 {
-	pid_t pid;
+	int i;
 
 	/* init ncurses */
 	initscr();
@@ -310,67 +457,32 @@ main(int argc, char** argv)
 	noecho();
 	curs_set(0);
 	keypad(stdscr, TRUE);
+	nodelay(stdscr, TRUE);
 
-	game = mmap(NULL, sizeof(struct state), PROT_READ | PROT_WRITE,
-			MAP_SHARED | MAP_ANONYMOUS, -1 , 0);
+	resetgame();
 
-	if (!game) {
-		perror("mmap()");
-		return EXIT_FAILURE;
-	}
+	while (!quit) {
 
-	if ((pid = fork()) == -1) {
-		perror("fork()");
-		return EXIT_FAILURE;
-	}
+		if (reset) resetgame();
 
-	if (pid != 0) { /* input handler */
-		int c, stat = 0;
-
-		close(STDOUT_FILENO); /* only input */
-
-		game->master = getpid();
-
-		while (!game->quit) {
-			c = getch();
-			if (c == KEY_RESIZE) {
-				game->redraw = 1;
-			} else if (c == ctrl('c') || c == ctrl('d')) {
-				game->quit = 1;
-			} else if (c == '\n' || c == KEY_ENTER) {
-				if (popup) {
-					popup_confirm = 1;
-					game->redraw = 1;
-				}
-			} else if (nocase(c) == 's' || c == KEY_DOWN) {
-				game->p.flags |= PF_FALL;
-			} else if (nocase(c) == 'w' || c == KEY_UP || c == ' ') {
-				game->p.flags |= PF_JUMP;
-			}
-			usleep(100);
-		}
-
-		waitpid(pid, 0, stat);
-		exit(0);
-	} else { /* gfx handler */
-
-		close(STDIN_FILENO); /* only output */
-
-		resetgame(game);
-
-		while (!game->quit) {
-			getmaxyx(stdscr, game->screenh, game->screenw);
-			if (game->screenw < screenminw || game->screenh < screenminw) {
-				wclear(stdscr);
-				printw("[X] Too few rows / columns to run properly.");
-				wrefresh(stdscr);
-				usleep(100);
-				continue;
-			}
-
+		getmaxyx(stdscr, screenh, screenw);
+		if (screenw < screenminw || screenh < screenminw) {
+			wclear(stdscr);
+			printw("[X] Too few rows / columns to run properly.");
 			wrefresh(stdscr);
-			dispupdate();
+			usleep(100);
+			continue;
 		}
+
+		floor = realloc(floor, screenw * sizeof(int));
+		floorlen = MIN(floorlen, screenw);
+
+		redraw = 0;
+		reset = 0;
+		confirm = 0;
+
+		wrefresh(stdscr);
+		dispupdate();
 	}
 
 	/* deinit ncurses */
