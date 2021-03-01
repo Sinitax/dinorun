@@ -16,9 +16,6 @@
 #define N(x) (x)
 #define I(x) (x | A_ITALIC)
 
-#define FOR_ADVANCE(pos, start) pos = start; pos; pos = pos->next
-#define FOR_ADVANCE_P(pos, start) pos = start; *pos; pos = &((*pos)->next)
-
 #define ARRSIZE(x) (sizeof(x)/sizeof((x)[0]))
 
 #define FRAME_RATE 30
@@ -423,7 +420,7 @@ dispupdate()
 			mvwaddch(gamewin, wh - groundy + 1, 1 + i, floor[i]);
 
 		/* draw obstacles */
-		for (FOR_ADVANCE(o, obstacles))
+		for (o = obstacles; o; o = o->next)
 			drawmodel(gamewin, o->x, o->y, o->m);
 
 		/* draw player */
